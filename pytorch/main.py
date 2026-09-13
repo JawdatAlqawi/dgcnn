@@ -37,10 +37,12 @@ def _init_():
     os.system('cp data.py checkpoints' + '/' + args.exp_name + '/' + 'data.py.backup')
 
 def train(args, io):
-    train_loader = DataLoader(ModelNet40(partition='train', num_points=args.num_points), num_workers=0,
-                              batch_size=args.batch_size, shuffle=True, drop_last=True)
-    test_loader = DataLoader(ModelNet40(partition='test', num_points=args.num_points), num_workers=0,
-                             batch_size=args.test_batch_size, shuffle=True, drop_last=False)
+    train_loader = DataLoader(ModelNet40(partition='train', num_points=args.num_points), num_workers=4,
+                              batch_size=args.batch_size, shuffle=True, drop_last=True,
+                              pin_memory=args.cuda)
+    test_loader = DataLoader(ModelNet40(partition='test', num_points=args.num_points), num_workers=4,
+                             batch_size=args.test_batch_size, shuffle=False, drop_last=False,
+                             pin_memory=args.cuda)
 
     device = torch.device("cuda" if args.cuda else "cpu")
 
@@ -67,6 +69,8 @@ def train(args, io):
     
     criterion = cal_loss
 
+    scaler = torch.cuda.amp.GradScaler(enabled=args.cuda)
+
     best_test_acc = 0
     for epoch in range(args.epochs):
         scheduler.step()
@@ -83,10 +87,12 @@ def train(args, io):
             data = data.permute(0, 2, 1)
             batch_size = data.size()[0]
             opt.zero_grad()
-            logits = model(data)
-            loss = criterion(logits, label)
-            loss.backward()
-            opt.step()
+            with torch.cuda.amp.autocast(enabled=args.cuda):
+                logits = model(data)
+                loss = criterion(logits, label)
+            scaler.scale(loss).backward()
+            scaler.step(opt)
+            scaler.update()
             preds = logits.max(dim=1)[1]
             count += batch_size
             train_loss += loss.item() * batch_size
@@ -140,7 +146,8 @@ def train(args, io):
 
 def test(args, io):
     test_loader = DataLoader(ModelNet40(partition='test', num_points=args.num_points),
-                             batch_size=args.test_batch_size, shuffle=True, drop_last=False)
+                             batch_size=args.test_batch_size, shuffle=False, drop_last=False,
+                             num_workers=4, pin_memory=args.cuda)
 
     device = torch.device("cuda" if args.cuda else "cpu")
 
