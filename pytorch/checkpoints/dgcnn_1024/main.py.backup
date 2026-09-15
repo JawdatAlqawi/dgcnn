@@ -10,14 +10,15 @@
 
 from __future__ import print_function
 import os
+import shutil
 import argparse
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.optim.lr_scheduler import CosineAnnealingLR
-from data import ModelNet40
-from model import PointNet, DGCNN
+from data import ModelNet40, ModelNet40PyG
+from model import PointNet, DGCNN, DGCNNPyG
 import numpy as np
 from torch.utils.data import DataLoader
 from util import cal_loss, IOStream
@@ -31,18 +32,28 @@ def _init_():
         os.makedirs('checkpoints/'+args.exp_name)
     if not os.path.exists('checkpoints/'+args.exp_name+'/'+'models'):
         os.makedirs('checkpoints/'+args.exp_name+'/'+'models')
-    os.system('cp main.py checkpoints'+'/'+args.exp_name+'/'+'main.py.backup')
-    os.system('cp model.py checkpoints' + '/' + args.exp_name + '/' + 'model.py.backup')
-    os.system('cp util.py checkpoints' + '/' + args.exp_name + '/' + 'util.py.backup')
-    os.system('cp data.py checkpoints' + '/' + args.exp_name + '/' + 'data.py.backup')
+    for f in ['main.py', 'model.py', 'util.py', 'data.py']:
+        if os.path.exists(f):
+            shutil.copy(f, os.path.join('checkpoints', args.exp_name, f + '.backup'))
 
 def train(args, io):
-    train_loader = DataLoader(ModelNet40(partition='train', num_points=args.num_points), num_workers=4,
-                              batch_size=args.batch_size, shuffle=True, drop_last=True,
-                              pin_memory=args.cuda)
-    test_loader = DataLoader(ModelNet40(partition='test', num_points=args.num_points), num_workers=4,
-                             batch_size=args.test_batch_size, shuffle=False, drop_last=False,
-                             pin_memory=args.cuda)
+    use_pyg = args.model == 'pyg_dgcnn'
+
+    if use_pyg:
+        from torch_geometric.loader import DataLoader as PyGDataLoader
+        train_loader = PyGDataLoader(ModelNet40PyG(partition='train', num_points=args.num_points),
+                                     num_workers=4, batch_size=args.batch_size, shuffle=True,
+                                     drop_last=True, pin_memory=args.cuda)
+        test_loader = PyGDataLoader(ModelNet40PyG(partition='test', num_points=args.num_points),
+                                    batch_size=args.test_batch_size, shuffle=False,
+                                    drop_last=False, pin_memory=args.cuda)
+    else:
+        train_loader = DataLoader(ModelNet40(partition='train', num_points=args.num_points), num_workers=4,
+                                  batch_size=args.batch_size, shuffle=True, drop_last=True,
+                                  pin_memory=args.cuda)
+        test_loader = DataLoader(ModelNet40(partition='test', num_points=args.num_points), num_workers=4,
+                                 batch_size=args.test_batch_size, shuffle=False, drop_last=False,
+                                 pin_memory=args.cuda)
 
     device = torch.device("cuda" if args.cuda else "cpu")
 
@@ -51,6 +62,8 @@ def train(args, io):
         model = PointNet(args).to(device)
     elif args.model == 'dgcnn':
         model = DGCNN(args).to(device)
+    elif args.model == 'pyg_dgcnn':
+        model = DGCNNPyG(args).to(device)
     else:
         raise Exception("Not implemented")
     print(str(model))
@@ -69,7 +82,7 @@ def train(args, io):
     
     criterion = cal_loss
 
-    scaler = torch.cuda.amp.GradScaler(enabled=args.cuda)
+    scaler = torch.amp.GradScaler('cuda', enabled=args.cuda)
 
     best_test_acc = 0
     for epoch in range(args.epochs):
@@ -82,13 +95,17 @@ def train(args, io):
         model.train()
         train_pred = []
         train_true = []
-        for data, label in train_loader:
-            data, label = data.to(device), label.to(device).squeeze()
-            data = data.permute(0, 2, 1)
-            batch_size = data.size()[0]
+        for batch in train_loader:
+            if use_pyg:
+                batch = batch.to(device)
+                data, label = batch.pos, batch.y.squeeze()
+            else:
+                data, label = batch[0].to(device), batch[1].to(device).squeeze()
+                data = data.permute(0, 2, 1)
+            batch_size = batch.num_graphs if use_pyg else data.size()[0]
             opt.zero_grad()
-            with torch.cuda.amp.autocast(enabled=args.cuda):
-                logits = model(data)
+            with torch.amp.autocast('cuda', enabled=args.cuda):
+                logits = model(batch if use_pyg else data)
                 loss = criterion(logits, label)
             scaler.scale(loss).backward()
             scaler.step(opt)
@@ -119,11 +136,16 @@ def train(args, io):
         test_pred = []
         test_true = []
         with torch.no_grad():
-            for data, label in test_loader:
-                data, label = data.to(device), label.to(device).squeeze()
-                data = data.permute(0, 2, 1)
-                batch_size = data.size()[0]
-                logits = model(data)
+            for batch in test_loader:
+                if use_pyg:
+                    batch = batch.to(device)
+                    data, label = batch.pos, batch.y.squeeze()
+                    logits = model(batch)
+                else:
+                    data, label = batch[0].to(device), batch[1].to(device).squeeze()
+                    data = data.permute(0, 2, 1)
+                    logits = model(data)
+                batch_size = batch.num_graphs if use_pyg else data.size()[0]
                 loss = criterion(logits, label)
                 preds = logits.max(dim=1)[1]
                 count += batch_size
@@ -145,14 +167,29 @@ def train(args, io):
 
 
 def test(args, io):
-    test_loader = DataLoader(ModelNet40(partition='test', num_points=args.num_points),
-                             batch_size=args.test_batch_size, shuffle=False, drop_last=False,
-                             num_workers=4, pin_memory=args.cuda)
+    use_pyg = args.model == 'pyg_dgcnn'
+
+    if use_pyg:
+        from torch_geometric.loader import DataLoader as PyGDataLoader
+        test_loader = PyGDataLoader(ModelNet40PyG(partition='test', num_points=args.num_points),
+                                    batch_size=args.test_batch_size, shuffle=False,
+                                    drop_last=False, num_workers=4, pin_memory=args.cuda)
+    else:
+        test_loader = DataLoader(ModelNet40(partition='test', num_points=args.num_points),
+                                 batch_size=args.test_batch_size, shuffle=False, drop_last=False,
+                                 num_workers=4, pin_memory=args.cuda)
 
     device = torch.device("cuda" if args.cuda else "cpu")
 
     #Try to load models
-    model = DGCNN(args).to(device)
+    if args.model == 'pointnet':
+        model = PointNet(args).to(device)
+    elif args.model == 'dgcnn':
+        model = DGCNN(args).to(device)
+    elif args.model == 'pyg_dgcnn':
+        model = DGCNNPyG(args).to(device)
+    else:
+        raise Exception("Not implemented")
     model.load_state_dict(torch.load(args.model_path, map_location=device))
     model = model.eval()
     test_acc = 0.0
@@ -160,12 +197,16 @@ def test(args, io):
     test_true = []
     test_pred = []
     with torch.no_grad():
-        for data, label in test_loader:
-
-            data, label = data.to(device), label.to(device).squeeze()
-            data = data.permute(0, 2, 1)
-            batch_size = data.size()[0]
-            logits = model(data)
+        for batch in test_loader:
+            if use_pyg:
+                batch = batch.to(device)
+                data, label = batch.pos, batch.y.squeeze()
+                logits = model(batch)
+            else:
+                data, label = batch[0].to(device), batch[1].to(device).squeeze()
+                data = data.permute(0, 2, 1)
+                logits = model(data)
+            batch_size = batch.num_graphs if use_pyg else data.size()[0]
             preds = logits.max(dim=1)[1]
             test_true.append(label.cpu().numpy())
             test_pred.append(preds.detach().cpu().numpy())
@@ -183,8 +224,8 @@ if __name__ == "__main__":
     parser.add_argument('--exp_name', type=str, default='exp', metavar='N',
                         help='Name of the experiment')
     parser.add_argument('--model', type=str, default='dgcnn', metavar='N',
-                        choices=['pointnet', 'dgcnn'],
-                        help='Model to use, [pointnet, dgcnn]')
+                        choices=['pointnet', 'dgcnn', 'pyg_dgcnn'],
+                        help='Model to use, [pointnet, dgcnn, pyg_dgcnn]')
     parser.add_argument('--dataset', type=str, default='modelnet40', metavar='N',
                         choices=['modelnet40'])
     parser.add_argument('--batch_size', type=int, default=32, metavar='batch_size',

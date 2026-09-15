@@ -151,3 +151,77 @@ class DGCNN(nn.Module):
         x = self.dp2(x)
         x = self.linear3(x)
         return x
+
+
+from torch_geometric.nn import MessagePassing, knn_graph, global_max_pool, global_mean_pool
+
+
+class EdgeConvPyG(MessagePassing):
+    """PyG EdgeConv block matching the original DGCNN graph feature construction.
+
+    Original get_graph_feature builds cat([neighbor-center, center]) and max-pools
+    over the k neighbors. We reproduce both with knn_graph + message passing.
+    """
+
+    def __init__(self, shared_mlp, k, **kwargs):
+        super(EdgeConvPyG, self).__init__(aggr='max', **kwargs)
+        self.k = k
+        self.nn = shared_mlp
+
+    def forward(self, x, batch):
+        edge_index = knn_graph(x.float(), self.k, batch, loop=True)
+        return self.propagate(edge_index, x=x)
+
+    def message(self, x_j, x_i):
+        return self.nn(torch.cat((x_j - x_i, x_i), dim=-1))
+
+
+class DGCNNPyG(nn.Module):
+    def __init__(self, args, output_channels=40):
+        super(DGCNNPyG, self).__init__()
+        self.args = args
+        self.k = args.k
+        self.is_pyg = True
+
+        def mlp(in_channels, out_channels):
+            return nn.Sequential(nn.Linear(in_channels, out_channels, bias=False),
+                                 nn.BatchNorm1d(out_channels),
+                                 nn.LeakyReLU(negative_slope=0.2))
+
+        self.conv1 = EdgeConvPyG(mlp(6, 64), k=self.k)
+        self.conv2 = EdgeConvPyG(mlp(128, 64), k=self.k)
+        self.conv3 = EdgeConvPyG(mlp(128, 128), k=self.k)
+        self.conv4 = EdgeConvPyG(mlp(256, 256), k=self.k)
+
+        self.conv5 = nn.Sequential(nn.Linear(512, args.emb_dims, bias=False),
+                                   nn.BatchNorm1d(args.emb_dims),
+                                   nn.LeakyReLU(negative_slope=0.2))
+        self.linear1 = nn.Linear(args.emb_dims*2, 512, bias=False)
+        self.bn6 = nn.BatchNorm1d(512)
+        self.dp1 = nn.Dropout(p=args.dropout)
+        self.linear2 = nn.Linear(512, 256)
+        self.bn7 = nn.BatchNorm1d(256)
+        self.dp2 = nn.Dropout(p=args.dropout)
+        self.linear3 = nn.Linear(256, output_channels)
+
+    def forward(self, batch):
+        x, batch_vec = batch.pos, batch.batch
+
+        x1 = self.conv1(x, batch_vec)
+        x2 = self.conv2(x1, batch_vec)
+        x3 = self.conv3(x2, batch_vec)
+        x4 = self.conv4(x3, batch_vec)
+
+        x = torch.cat((x1, x2, x3, x4), dim=1)
+        x = self.conv5(x)
+
+        x1 = global_max_pool(x, batch_vec)
+        x2 = global_mean_pool(x, batch_vec)
+        x = torch.cat((x1, x2), dim=1)
+
+        x = F.leaky_relu(self.bn6(self.linear1(x)), negative_slope=0.2)
+        x = self.dp1(x)
+        x = F.leaky_relu(self.bn7(self.linear2(x)), negative_slope=0.2)
+        x = self.dp2(x)
+        x = self.linear3(x)
+        return x

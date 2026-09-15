@@ -13,6 +13,7 @@ import sys
 import glob
 import h5py
 import numpy as np
+import torch
 from torch.utils.data import Dataset
 
 
@@ -74,6 +75,27 @@ class ModelNet40(Dataset):
             pointcloud = translate_pointcloud(pointcloud)
             np.random.shuffle(pointcloud)
         return pointcloud, label
+
+    def __len__(self):
+        return self.data.shape[0]
+
+
+from torch_geometric.data import Data
+
+
+class ModelNet40PyG(Dataset):
+    def __init__(self, num_points, partition='train'):
+        self.data, self.label = load_data(partition)
+        self.num_points = num_points
+        self.partition = partition
+
+    def __getitem__(self, item):
+        pointcloud = self.data[item][:self.num_points]
+        label = self.label[item]
+        if self.partition == 'train':
+            pointcloud = translate_pointcloud(pointcloud)
+            np.random.shuffle(pointcloud)
+        return Data(pos=torch.from_numpy(pointcloud), y=torch.tensor(label))
 
     def __len__(self):
         return self.data.shape[0]
